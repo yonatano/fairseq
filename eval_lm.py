@@ -205,12 +205,130 @@ def main(parsed_args):
         for ws in sorted(word_stats.values(), key=lambda x: x.count, reverse=True):
             print(ws)
 
+def test(parsed_args):
+    # Make sure we didn't screw up the params
+    assert parsed_args.path is not None, '--path required for evaluation!'
+    assert parsed_args.sample_break_mode == 'eos', 'Sample break mode must be eos!'
+
+    # Print the args
+    import_user_module(parsed_args)
+    print(parsed_args)
+
+    # Do we use CUDA
+    use_cuda = torch.cuda.is_available() and not parsed_args.cpu
+
+    # Get the task (Language Modeling)
+    task = tasks.setup_task(parsed_args)
+
+    # Load ensemble
+    print('| loading model(s) from {}'.format(parsed_args.path))
+    models, args = utils.load_ensemble_for_inference(
+        parsed_args.path.split(':'), task, model_arg_overrides=eval(parsed_args.model_overrides),
+    )
+
+    for arg in vars(parsed_args).keys():
+        if arg not in {'self_target', 'future_target', 'past_target', 'tokens_per_sample', 'output_size_dictionary'}:
+            setattr(args, arg, getattr(parsed_args, arg))
+
+    # Load dataset splits
+    task.load_dataset(args.gen_subset)
+    dataset = task.dataset(args.gen_subset)
+    if args.context_window > 0:
+        dataset = LMContextWindowDataset(
+            dataset=dataset,
+            tokens_per_sample=args.tokens_per_sample,
+            context_window=args.context_window,
+            pad_idx=task.source_dictionary.pad(),
+        )
+    print('| {} {} {} examples'.format(args.data, args.gen_subset, len(dataset)))
+
+    # Optimize model for generation
+    assert len(models) > 0
+    model = models[0]
+    model.make_generation_fast_()
+    if args.fp16:
+            model.half()
+    if use_cuda:
+        model.cuda()
+
+    # Make data iterator
+    itr = task.get_batch_iterator(
+        dataset=dataset,
+        max_tokens=args.max_tokens or 36000,
+        max_sentences=args.max_sentences,
+        max_positions=utils.resolve_max_positions(*[
+            model.max_positions() for model in models
+        ]),
+        ignore_invalid_inputs=True,
+        num_shards=args.num_shards,
+        shard_id=args.shard_id,
+        num_workers=args.num_workers,
+    ).next_epoch_itr(shuffle=False)
+
+    # Iterate over batches of sentences
+    # Get the sentence logps for the batch
+    all_s_logps = []
+    all_n_sentences = 0
+    for sample in itr:
+        if 'net_input' not in sample:
+            continue
+
+        # Move sample to GPU if possible
+        sample = utils.move_to_cuda(sample) if use_cuda else sample
+
+        # Number of sentences in this batch
+        bsz = sample['nsentences']
+        all_n_sentences += bsz 
+
+        # Get the softmax outputs for the batch
+        # The resultant tensor has shape: BATCH_SZ x N_TOKENS x VOCAB_SZ
+        probs = []
+        net_input = sample['net_input']
+        with torch.no_grad():
+            model.eval()
+            decoder_out = model.forward(**net_input)
+            probs = model.get_normalized_probs(decoder_out, log_probs=True, sample=sample).data 
+
+        # Make sure we have a softmax-sequence for each sentence in the batch
+        assert len(probs) == bsz
+
+        # Assert that the softmax output is correct
+        assert torch.allclose(torch.sum(torch.exp(probs), dim=2), torch.ones(probs.shape[:2]))
+
+        # Get the token logps for each sentence from the softmax outputs
+        target = sample['target']
+        logps = probs.gather(
+            dim=2,
+            index=target.unsqueeze(-1),
+        ).squeeze(2)
+
+        # Iterate over each sentence in the batch
+        # Get the sum of logps for each sentence
+        start_idxs = [0] * bsz
+        for i in range(bsz):
+            
+            # Get the token indices / strings
+            tokens          = utils.strip_pad(target[i, start_idxs[i]:], task.source_dictionary.pad())
+            token_idxs      = [tokens[i].item() for i in range(len(tokens))]
+            token_strings   = [task.source_dictionary[idx] for idx in token_idxs]
+
+            # This is the original sentence
+            sentence = ' '.join(token_strings)
+            
+            # Get the token logps for this sentence
+            s_len = len(tokens)
+            s_logps = logps[i][:s_len]
+            all_s_logps.append(torch.sum(s_logps))
+
+    # Get the average sentence logp over all sentences in the test set
+    avg_s_logp = sum(all_s_logps) / all_n_sentences
+    print(-1 * avg_s_logp.item())
 
 def cli_main():
     parser = options.get_eval_lm_parser()
     args = options.parse_args_and_arch(parser)
-    main(args)
-
+    test(args)
+    # main(args)
 
 if __name__ == '__main__':
     cli_main()
