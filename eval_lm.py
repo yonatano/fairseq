@@ -268,6 +268,7 @@ def test(parsed_args):
     # Iterate over batches of sentences
     # Get the sentence logps for the batch
     all_s_logps = []
+    all_n_tokens = 0
     all_n_sentences = 0
     for sample in itr:
         if 'net_input' not in sample:
@@ -311,6 +312,9 @@ def test(parsed_args):
             tokens          = utils.strip_pad(target[i, start_idxs[i]:], task.source_dictionary.pad())
             token_idxs      = [tokens[i].item() for i in range(len(tokens))]
             token_strings   = [task.source_dictionary[idx] for idx in token_idxs]
+
+            # Maintain total number of tokens
+            all_n_tokens += len(tokens)
 
             # This is the original sentence
             sentence = ' '.join(token_strings)
