@@ -298,6 +298,12 @@ class FairseqLanguageModel(BaseFairseqModel):
         """Removes the head of the model (e.g. the softmax layer) to conserve space when it is not needed"""
         raise NotImplementedError()
 
+class FairseqDROLanguageModel(FairseqLanguageModel):
+    """Base class for DRO LM."""
+
+    def __init__(self, decoder):
+        super().__init__(decoder)
+        self.eta = nn.Parameter(torch.Tensor([0.0]), requires_grad=True)
 
 class FairseqEncoderModel(BaseFairseqModel):
     """Base class for encoder-only models.
